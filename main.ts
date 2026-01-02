@@ -41,16 +41,19 @@ class LinkRecordingModal extends Modal {
 	private audioFiles: TFile[];
 	private selectedFile: TFile | null;
 	private startTimeInputValue: string;
+	private fileLocked: boolean;
 
 	constructor(
 		app: App,
 		plugin: RecordingIndicatorPlugin,
 		onSubmit: (file: TFile, startTime: Date) => void,
-		presetFile?: TFile | null
+		presetFile?: TFile | null,
+		fileLocked: boolean = false
 	) {
 		super(app);
 		this.plugin = plugin;
 		this.onSubmit = onSubmit;
+		this.fileLocked = fileLocked;
 		this.audioFiles = plugin.getAudioFiles();
 
 		if (presetFile && !this.audioFiles.some((file) => file.path === presetFile.path)) {
@@ -79,26 +82,38 @@ class LinkRecordingModal extends Modal {
 
 		let timeInput: import('obsidian').TextComponent;
 
-		new Setting(contentEl)
-			.setName('Fichier audio')
-			.setDesc('Sélectionnez l\'enregistrement à lier.')
-			.addDropdown((dropdown) => {
-				this.audioFiles.forEach((file) => dropdown.addOption(file.path, file.basename));
-				if (this.selectedFile) {
-					dropdown.setValue(this.selectedFile.path);
-				}
-				dropdown.onChange((value) => {
-					const file = this.audioFiles.find((f) => f.path === value) ?? null;
-					this.selectedFile = file;
-					if (file) {
-						const suggestion = this.plugin.getDefaultStartTimeString(file);
-						if (suggestion) {
-							this.startTimeInputValue = suggestion;
-							timeInput.setValue(suggestion);
-						}
-					}
+		if (this.fileLocked && this.selectedFile) {
+			// Afficher le fichier en lecture seule si verrouillé
+			new Setting(contentEl)
+				.setName('Fichier audio')
+				.setDesc('Fichier sélectionné depuis le lecteur.')
+				.addText((text) => {
+					text.setValue(this.selectedFile!.basename);
+					text.setDisabled(true);
 				});
-			});
+		} else {
+			// Afficher le dropdown pour choisir le fichier
+			new Setting(contentEl)
+				.setName('Fichier audio')
+				.setDesc('Sélectionnez l\'enregistrement à lier.')
+				.addDropdown((dropdown) => {
+					this.audioFiles.forEach((file) => dropdown.addOption(file.path, file.basename));
+					if (this.selectedFile) {
+						dropdown.setValue(this.selectedFile.path);
+					}
+					dropdown.onChange((value) => {
+						const file = this.audioFiles.find((f) => f.path === value) ?? null;
+						this.selectedFile = file;
+						if (file) {
+							const suggestion = this.plugin.getDefaultStartTimeString(file);
+							if (suggestion) {
+								this.startTimeInputValue = suggestion;
+								timeInput.setValue(suggestion);
+							}
+						}
+					});
+				});
+		}
 
 		new Setting(contentEl)
 			.setName('Heure de début')
@@ -182,6 +197,9 @@ export default class RecordingIndicatorPlugin extends Plugin {
 	private styledRoots = new WeakSet<ShadowRoot>();
 	private shadowPatchApplied = false;
 	private originalAttachShadow: (typeof Element.prototype.attachShadow) | null = null;
+	private cacheSeeded = false;
+	private modifyTimeout: NodeJS.Timeout | null = null;
+	private pluginStartTime: number = Date.now();
 
 	private handleEditorChange = (cm: any, change: any, note: TFile | null) => {
 		if (!change || change.origin === 'setValue') return;
@@ -200,6 +218,7 @@ export default class RecordingIndicatorPlugin extends Plugin {
 
 	async onload() {
 		await this.loadSettings();
+		this.pluginStartTime = Date.now();
 
 		this.addSettingTab(new RecordingIndicatorSettingTab(this.app, this));
 
@@ -218,7 +237,7 @@ export default class RecordingIndicatorPlugin extends Plugin {
 
 		this.app.workspace.onLayoutReady(() => {
 			this.attachEditorHandlers();
-			this.seedResourcePathCache();
+			// Cache lazy - ne sera rempli que quand nécessaire
 			this.observeMediaPlayers();
 		});
 		this.registerEvent(
@@ -234,7 +253,12 @@ export default class RecordingIndicatorPlugin extends Plugin {
 					return;
 				}
 
-				if (this.settings.showNotifications) {
+				// Ignorer les notifications pendant les 3 premières secondes après le démarrage
+				// pour éviter d'afficher des notifications pour les fichiers existants
+				const timeSinceStart = Date.now() - this.pluginStartTime;
+				const isNewFile = timeSinceStart > 3000;
+
+				if (isNewFile && this.settings.showNotifications) {
 					new Notice(
 						`Fichier audio importé : ${file.basename}. Utilisez "Associer un fichier audio aux horodatages" pour convertir vos marqueurs.`,
 						4000
@@ -266,10 +290,25 @@ export default class RecordingIndicatorPlugin extends Plugin {
 				if (!(file instanceof TFile) || !this.isAudioFile(file)) {
 					return;
 				}
-				this.clearResourceCacheForFile(file);
-				this.cacheResourcePathForFile(file);
+				// Debounce pour éviter les scans trop fréquents
+				if (this.modifyTimeout) {
+					clearTimeout(this.modifyTimeout);
+				}
+				this.modifyTimeout = setTimeout(() => {
+					this.clearResourceCacheForFile(file);
+					this.cacheResourcePathForFile(file);
+					this.modifyTimeout = null;
+				}, 500);
 			})
 		);
+
+		// Nettoyer le timeout à la désactivation
+		this.register(() => {
+			if (this.modifyTimeout) {
+				clearTimeout(this.modifyTimeout);
+				this.modifyTimeout = null;
+			}
+		});
 	}
 
 	async loadSettings() {
@@ -281,6 +320,12 @@ export default class RecordingIndicatorPlugin extends Plugin {
 	}
 
 	getAudioFiles(): TFile[] {
+		// Utiliser le cache si disponible pour éviter de scanner tous les fichiers
+		if (this.cacheSeeded && this.resourcePathCache.size > 0) {
+			// Si le cache est déjà rempli, on peut l'utiliser partiellement
+			// Mais pour getAudioFiles(), on doit retourner tous les fichiers audio
+			// donc on garde le scan complet mais seulement quand nécessaire
+		}
 		return this.app.vault.getFiles().filter((file) => this.isAudioFile(file));
 	}
 
@@ -303,14 +348,15 @@ export default class RecordingIndicatorPlugin extends Plugin {
 		}
 	}
 
-	openLinkRecordingModal(presetFile?: TFile | null) {
+	openLinkRecordingModal(presetFile?: TFile | null, fileLocked: boolean = false) {
 		new LinkRecordingModal(
 			this.app,
 			this,
 			(file, startTime) => {
 				void this.linkRecordingToActiveNote(file, startTime);
 			},
-			presetFile
+			presetFile,
+			fileLocked
 		).open();
 	}
 
@@ -693,6 +739,11 @@ export default class RecordingIndicatorPlugin extends Plugin {
 			return;
 		}
 
+		// Éviter les appels multiples
+		if (this.observedRoots.has(document)) {
+			return;
+		}
+
 		this.patchAttachShadow();
 		this.observeRoot(document);
 		this.observeExistingShadowHosts();
@@ -853,8 +904,14 @@ export default class RecordingIndicatorPlugin extends Plugin {
 	}
 
 	private seedResourcePathCache() {
-		this.resourcePathCache.clear();
-		this.getAudioFiles().forEach((file) => this.cacheResourcePathForFile(file));
+		if (this.cacheSeeded) {
+			return;
+		}
+		this.cacheSeeded = true;
+		// Limiter le scan initial - ne cacher que les premiers fichiers
+		const audioFiles = this.getAudioFiles();
+		// Ne cacher que les 50 premiers fichiers pour éviter un scan complet au démarrage
+		audioFiles.slice(0, 50).forEach((file) => this.cacheResourcePathForFile(file));
 	}
 
 	private decorateMediaPlayer(player: HTMLElement) {
@@ -926,7 +983,8 @@ export default class RecordingIndicatorPlugin extends Plugin {
 				new Notice('Impossible de retrouver le fichier audio lié.');
 				return;
 			}
-			this.openLinkRecordingModal(file);
+			// Verrouiller le fichier quand on clique depuis le bouton du lecteur
+			this.openLinkRecordingModal(file, true);
 		});
 
 		container.appendChild(button);
@@ -990,6 +1048,20 @@ export default class RecordingIndicatorPlugin extends Plugin {
 			return cachedWithoutQuery;
 		}
 
+		// Seed le cache si nécessaire (lazy loading)
+		this.seedResourcePathCache();
+
+		// Chercher dans le cache d'abord
+		for (const [cachedPath, file] of this.resourcePathCache.entries()) {
+			const baseCached = cachedPath.split('?')[0] ?? cachedPath;
+			if (cachedPath === resourcePath || baseCached === resourceWithoutQuery) {
+				this.resourcePathCache.set(resourcePath, file);
+				this.resourcePathCache.set(resourceWithoutQuery, file);
+				return file;
+			}
+		}
+
+		// Si pas trouvé dans le cache, chercher dans tous les fichiers (mais seulement si nécessaire)
 		for (const file of this.getAudioFiles()) {
 			const adapterResource = this.getAdapterResourcePath(file);
 			if (!adapterResource) {
