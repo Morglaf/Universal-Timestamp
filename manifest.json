@@ -1,0 +1,11 @@
+{
+	"id": "universal-timestamp",
+	"name": "Universal Timestamp",
+	"version": "1.0.0",
+	"minAppVersion": "0.15.0",
+	"description": "Insérez des horodatages universels et associez-les à vos enregistrements externes dans Obsidian",
+	"author": "Assistant",
+	"authorUrl": "",
+	"fundingUrl": "",
+	"isDesktopOnly": false
+} 

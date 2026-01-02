@@ -1,0 +1,89 @@
+import { App, PluginSettingTab, Setting } from 'obsidian';
+import RecordingIndicatorPlugin from './main';
+
+export class RecordingIndicatorSettingTab extends PluginSettingTab {
+	plugin: RecordingIndicatorPlugin;
+
+	constructor(app: App, plugin: RecordingIndicatorPlugin) {
+		super(app, plugin);
+		this.plugin = plugin;
+	}
+
+	display(): void {
+		const { containerEl } = this;
+
+		containerEl.empty();
+		containerEl.addClass('recording-indicator-settings');
+
+		containerEl.createEl('h2', { text: 'Horodatages universels' });
+
+		containerEl.createEl('p', {
+			text: 'Insérez des horodatages pendant vos prises de notes puis associez-les à un enregistrement importé. Les placeholders seront transformés en liens #t=… lors de l’association.'
+		});
+
+		containerEl.createEl('h3', { text: 'Affichage' });
+
+		new Setting(containerEl)
+			.setName('Format des horodatages')
+			.setDesc('Utilisez {time} pour afficher la valeur calculée (exemple : "[{time}]").')
+			.addText((text) =>
+				text
+					.setPlaceholder('[{time}]')
+					.setValue(this.plugin.settings.timecodeFormat)
+					.onChange(async (value) => {
+						this.plugin.settings.timecodeFormat = value.trim() || '[{time}]';
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName('Afficher les secondes')
+			.setDesc('Inclut les secondes dans les labels visibles et les liens générés.')
+			.addToggle((toggle) =>
+				toggle.setValue(this.plugin.settings.showSeconds).onChange(async (value) => {
+					this.plugin.settings.showSeconds = value;
+					await this.plugin.saveSettings();
+				})
+			);
+
+		new Setting(containerEl)
+			.setName('Décalage temporel (secondes)')
+			.setDesc('Décalage à appliquer aux horodatages insérés (positif ou négatif). Exemple : -5 pour avancer de 5 secondes, +10 pour retarder de 10 secondes.')
+			.addText((text) =>
+				text
+					.setPlaceholder('0')
+					.setValue(this.plugin.settings.timeOffsetSeconds.toString())
+					.onChange(async (value) => {
+						const numValue = Number.parseInt(value, 10);
+						if (!Number.isNaN(numValue)) {
+							this.plugin.settings.timeOffsetSeconds = numValue;
+							await this.plugin.saveSettings();
+						}
+					})
+			);
+
+		containerEl.createEl('h3', { text: 'Notifications' });
+
+		new Setting(containerEl)
+			.setName('Notifications')
+			.setDesc('Affiche des notifications lors de l\'insertion ou de l\'association des horodatages.')
+			.addToggle((toggle) =>
+				toggle.setValue(this.plugin.settings.showNotifications).onChange(async (value) => {
+					this.plugin.settings.showNotifications = value;
+					await this.plugin.saveSettings();
+				})
+			);
+
+		containerEl.createEl('h3', { text: 'Conseils' });
+
+		const tips = containerEl.createEl('div');
+		tips.innerHTML = `
+			<ul>
+				<li>Utilisez <code>Ctrl+Shift+T</code> pour insérer un horodatage universel à tout moment.</li>
+				<li>Nommez vos fichiers audio avec leur date/heure de démarrage (ex. <code>2025-11-07 16.32.23.m4a</code>) pour pré-remplir automatiquement l'heure de début.</li>
+				<li>Après import, lancez la commande <em>Associer un fichier audio aux horodatages</em> puis indiquez l'heure exacte de démarrage de l'enregistrement.</li>
+			</ul>
+		`;
+	}
+}
+
