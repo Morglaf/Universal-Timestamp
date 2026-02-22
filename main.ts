@@ -1,11 +1,14 @@
-import { Plugin, Editor, MarkdownView, Notice, TFile, App, Modal, Setting, normalizePath, CachedMetadata, setIcon } from 'obsidian';
+import { Plugin, Editor, MarkdownView, Notice, TFile, App, Modal, Setting, normalizePath, CachedMetadata, setIcon, MarkdownPostProcessorContext, MarkdownRenderChild, editorLivePreviewField } from 'obsidian';
 import { RecordingIndicatorSettingTab } from './settings';
+import { Decoration, DecorationSet, EditorView, keymap, PluginValue, ViewPlugin, ViewUpdate, WidgetType } from '@codemirror/view';
+import { RangeSetBuilder, Prec } from '@codemirror/state';
 
 interface RecordingIndicatorSettings {
 	showNotifications: boolean;
 	showSeconds: boolean;
 	timecodeFormat: string;
 	timeOffsetSeconds: number;
+	timecodeAdjustmentSeconds: number;
 }
 
 interface PlaceholderMatch {
@@ -20,8 +23,11 @@ const DEFAULT_SETTINGS: RecordingIndicatorSettings = {
 	showNotifications: true,
 	showSeconds: true,
 	timecodeFormat: '[{time}]',
-	timeOffsetSeconds: 0
+	timeOffsetSeconds: 0,
+	timecodeAdjustmentSeconds: 10
 };
+
+const TIMECODE_PLACEHOLDER_REGEX = /%%REC\{"time":"([^"]+)"\}%%(\[[^\]]+\]|\([^)]+\)|[^\s]+)/g;
 
 const AUDIO_EXTENSIONS = new Set([
 	'mp3',
@@ -188,6 +194,306 @@ class AssociationPromptModal extends Modal {
 	}
 }
 
+class TimecodeWidget extends MarkdownRenderChild {
+	private plugin: RecordingIndicatorPlugin;
+	private isoTime: string;
+	private sourcePath: string;
+	private adjustmentSeconds: number;
+
+	constructor(
+		containerEl: HTMLElement,
+		plugin: RecordingIndicatorPlugin,
+		isoTime: string,
+		sourcePath: string
+	) {
+		super(containerEl);
+		this.plugin = plugin;
+		this.isoTime = isoTime;
+		this.sourcePath = sourcePath;
+		this.adjustmentSeconds = plugin.settings.timecodeAdjustmentSeconds;
+	}
+
+	onload() {
+		const container = this.containerEl;
+		container.empty();
+		container.addClass('ut-timecode-widget');
+
+		const timestamp = new Date(this.isoTime);
+		if (Number.isNaN(timestamp.getTime())) {
+			container.setText('[Invalid timestamp]');
+			return;
+		}
+
+		const minusBtn = container.createEl('button', {
+			cls: 'ut-timecode-btn',
+			attr: { 'aria-label': `Retirer ${this.adjustmentSeconds}s` }
+		});
+		minusBtn.setText(`-${this.adjustmentSeconds}s`);
+		minusBtn.addEventListener('click', () => this.adjustTime(-this.adjustmentSeconds));
+
+		const display = container.createEl('span', { cls: 'ut-timecode-display' });
+		display.setText(this.plugin.getCompactTimeLabel(timestamp));
+
+		const plusBtn = container.createEl('button', {
+			cls: 'ut-timecode-btn',
+			attr: { 'aria-label': `Ajouter ${this.adjustmentSeconds}s` }
+		});
+		plusBtn.setText(`+${this.adjustmentSeconds}s`);
+		plusBtn.addEventListener('click', () => this.adjustTime(this.adjustmentSeconds));
+	}
+
+	private async adjustTime(deltaSeconds: number) {
+		const currentTime = new Date(this.isoTime);
+		if (Number.isNaN(currentTime.getTime())) {
+			new Notice('Impossible d\'ajuster un horodatage invalide.');
+			return;
+		}
+
+		const newTime = new Date(currentTime.getTime() + deltaSeconds * 1000);
+		const newIsoTime = newTime.toISOString();
+
+		const file = this.plugin.app.vault.getAbstractFileByPath(this.sourcePath);
+		if (!(file instanceof TFile)) {
+			new Notice('Fichier source introuvable.');
+			return;
+		}
+
+		const content = await this.plugin.app.vault.read(file);
+		const oldPlaceholder = `%%REC{"time":"${this.isoTime}"}%%`;
+		const newPlaceholder = `%%REC{"time":"${newIsoTime}"}%%`;
+
+		const oldLabel = this.plugin.buildPlaceholderLabel(currentTime);
+		const newLabel = this.plugin.buildPlaceholderLabel(newTime);
+
+		const fullOldPattern = `${oldPlaceholder}${oldLabel}`;
+		const fullNewPattern = `${newPlaceholder}${newLabel}`;
+
+		if (content.includes(fullOldPattern)) {
+			const newContent = content.replace(fullOldPattern, fullNewPattern);
+			await this.plugin.app.vault.modify(file, newContent);
+			this.isoTime = newIsoTime;
+
+			const display = this.containerEl.querySelector('.ut-timecode-display');
+			if (display) {
+				display.setText(this.plugin.getCompactTimeLabel(newTime));
+			}
+
+			if (this.plugin.settings.showNotifications) {
+				new Notice(`Timecode ajusté : ${newLabel}`);
+			}
+		} else {
+			new Notice('Impossible de trouver le timecode dans le fichier.');
+		}
+	}
+}
+
+class TimecodeWidgetCM extends WidgetType {
+	constructor(
+		private plugin: RecordingIndicatorPlugin,
+		private isoTime: string,
+		private sourcePath: string,
+		private fullMatch: string
+	) {
+		super();
+	}
+
+	toDOM(): HTMLElement {
+		const container = document.createElement('span');
+		container.addClass('ut-timecode-widget');
+
+		const timestamp = new Date(this.isoTime);
+		if (Number.isNaN(timestamp.getTime())) {
+			container.setText('[Invalid timestamp]');
+			return container;
+		}
+
+		const adjustmentSeconds = this.plugin.settings.timecodeAdjustmentSeconds;
+
+		const minusBtn = container.createEl('button', {
+			cls: 'ut-timecode-btn',
+			attr: { 'aria-label': `Retirer ${adjustmentSeconds}s` }
+		});
+		minusBtn.setText(`-${adjustmentSeconds}s`);
+		minusBtn.addEventListener('click', () => this.adjustTime(-adjustmentSeconds));
+
+		const display = container.createEl('span', { cls: 'ut-timecode-display' });
+		display.setText(this.plugin.getCompactTimeLabel(timestamp));
+
+		const plusBtn = container.createEl('button', {
+			cls: 'ut-timecode-btn',
+			attr: { 'aria-label': `Ajouter ${adjustmentSeconds}s` }
+		});
+		plusBtn.setText(`+${adjustmentSeconds}s`);
+		plusBtn.addEventListener('click', () => this.adjustTime(adjustmentSeconds));
+
+		return container;
+	}
+
+	private async adjustTime(deltaSeconds: number) {
+		const currentTime = new Date(this.isoTime);
+		if (Number.isNaN(currentTime.getTime())) {
+			new Notice('Impossible d\'ajuster un horodatage invalide.');
+			return;
+		}
+
+		const newTime = new Date(currentTime.getTime() + deltaSeconds * 1000);
+		const newIsoTime = newTime.toISOString();
+
+		const file = this.plugin.app.vault.getAbstractFileByPath(this.sourcePath);
+		if (!(file instanceof TFile)) {
+			new Notice('Fichier source introuvable.');
+			return;
+		}
+
+		const content = await this.plugin.app.vault.read(file);
+		const oldPlaceholder = `%%REC{"time":"${this.isoTime}"}%%`;
+		const newPlaceholder = `%%REC{"time":"${newIsoTime}"}%%`;
+
+		const oldLabel = this.plugin.buildPlaceholderLabel(currentTime);
+		const newLabel = this.plugin.buildPlaceholderLabel(newTime);
+
+		const fullOldPattern = `${oldPlaceholder}${oldLabel}`;
+		const fullNewPattern = `${newPlaceholder}${newLabel}`;
+
+		if (content.includes(fullOldPattern)) {
+			const newContent = content.replace(fullOldPattern, fullNewPattern);
+			await this.plugin.app.vault.modify(file, newContent);
+
+			if (this.plugin.settings.showNotifications) {
+				new Notice(`Timecode ajusté : ${newLabel}`);
+			}
+		} else {
+			new Notice('Impossible de trouver le timecode dans le fichier.');
+		}
+	}
+}
+
+class TimecodeViewPlugin implements PluginValue {
+	decorations: DecorationSet;
+
+	constructor(
+		private view: EditorView,
+		private plugin: RecordingIndicatorPlugin
+	) {
+		this.decorations = this.buildDecorations(view);
+	}
+
+	update(update: ViewUpdate) {
+		if (update.docChanged || update.viewportChanged) {
+			this.decorations = this.buildDecorations(update.view);
+		}
+	}
+
+	destroy() {}
+
+	buildDecorations(view: EditorView): DecorationSet {
+		const builder = new RangeSetBuilder<Decoration>();
+
+		for (const { from, to } of view.visibleRanges) {
+			const text = view.state.doc.sliceString(from, to);
+			let match: RegExpExecArray | null;
+			const regex = new RegExp(TIMECODE_PLACEHOLDER_REGEX.source, 'g');
+
+			while ((match = regex.exec(text)) !== null) {
+				const start = from + match.index;
+				const end = start + match[0].length;
+				
+				if (end > view.state.doc.length) {
+					continue;
+				}
+				
+				const isoTime = match[1];
+				
+				const activeView = this.plugin.app.workspace.getActiveViewOfType(MarkdownView);
+				const sourcePath = activeView?.file?.path || '';
+
+				const widget = Decoration.replace({
+					widget: new TimecodeWidgetCM(this.plugin, isoTime, sourcePath, match[0]),
+					inclusive: false
+				});
+
+				builder.add(start, end, widget);
+			}
+		}
+
+		return builder.finish();
+	}
+}
+
+const createTimecodeViewPlugin = (plugin: RecordingIndicatorPlugin) => {
+	return ViewPlugin.fromClass(
+		class extends TimecodeViewPlugin {
+			constructor(view: EditorView) {
+				super(view, plugin);
+			}
+		},
+		{
+			decorations: (value) => value.decorations
+		}
+	);
+};
+
+function tryDeleteTimecodePlaceholder(view: EditorView, isBackspace: boolean): boolean {
+	const doc = view.state.doc.toString();
+	const pos = view.state.selection.main.head;
+	const regex = new RegExp(TIMECODE_PLACEHOLDER_REGEX.source, 'g');
+	let match: RegExpExecArray | null;
+	while ((match = regex.exec(doc)) !== null) {
+		const start = match.index;
+		const end = match.index + match[0].length;
+		if (isBackspace && pos > start && pos <= end) {
+			view.dispatch({ changes: { from: start, to: end }, selection: { anchor: start } });
+			return true;
+		}
+		if (!isBackspace && pos >= start && pos < end) {
+			view.dispatch({ changes: { from: start, to: end }, selection: { anchor: start } });
+			return true;
+		}
+	}
+	return false;
+}
+
+function findPlaceholderAtPos(doc: string, pos: number): { start: number; end: number } | null {
+	const regex = new RegExp(TIMECODE_PLACEHOLDER_REGEX.source, 'g');
+	let match: RegExpExecArray | null;
+	while ((match = regex.exec(doc)) !== null) {
+		const start = match.index;
+		const end = match.index + match[0].length;
+		if (pos >= start && pos <= end) {
+			return { start, end };
+		}
+	}
+	return null;
+}
+
+function moveCursorOverTimecode(view: EditorView, forward: boolean): boolean {
+	const doc = view.state.doc.toString();
+	const pos = view.state.selection.main.head;
+	const placeholder = findPlaceholderAtPos(doc, pos);
+	if (!placeholder) {
+		return false;
+	}
+	const { start, end } = placeholder;
+	if (forward && pos < end) {
+		view.dispatch({ selection: { anchor: end } });
+		return true;
+	}
+	if (!forward && pos > start) {
+		view.dispatch({ selection: { anchor: start } });
+		return true;
+	}
+	return false;
+}
+
+const timecodeAtomicDeleteKeymap = Prec.high(
+	keymap.of([
+		{ key: 'Backspace', run: (view) => tryDeleteTimecodePlaceholder(view, true) },
+		{ key: 'Delete', run: (view) => tryDeleteTimecodePlaceholder(view, false) },
+		{ key: 'ArrowLeft', run: (view) => moveCursorOverTimecode(view, false) },
+		{ key: 'ArrowRight', run: (view) => moveCursorOverTimecode(view, true) }
+	])
+);
+
 export default class RecordingIndicatorPlugin extends Plugin {
 	settings: RecordingIndicatorSettings;
 	private promptedAssociations = new Set<string>();
@@ -234,6 +540,12 @@ export default class RecordingIndicatorPlugin extends Plugin {
 		name: 'Associer un fichier audio aux horodatages',
 			callback: () => this.openLinkRecordingModal()
 		});
+
+		this.registerMarkdownPostProcessor((element, context) => {
+			this.processTimecodeWidgets(element, context);
+		});
+
+		this.registerEditorExtension([createTimecodeViewPlugin(this), timecodeAtomicDeleteKeymap]);
 
 		this.app.workspace.onLayoutReady(() => {
 			this.attachEditorHandlers();
@@ -335,8 +647,31 @@ export default class RecordingIndicatorPlugin extends Plugin {
 	}
 
 	insertTimecode(editor: Editor) {
+		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+		const currentFile = view?.file;
+
+		if (currentFile) {
+			const linkedAudio = this.getLinkedAudioFile(currentFile);
+			
+			if (linkedAudio) {
+				const player = this.findPlayerForFile(linkedAudio);
+				
+				if (player) {
+					const offsetSeconds = Math.round(player.currentTime);
+					const display = this.formatOffset(offsetSeconds);
+					const linkText = this.app.metadataCache.fileToLinktext(linkedAudio, currentFile.path);
+					const link = `[[${linkText}#t=${offsetSeconds}|${display}]]`;
+					
+					editor.replaceSelection(link);
+					
+					if (this.settings.showNotifications) {
+						new Notice(`Timecode inséré depuis le player : ${display}`);
+					}
+					return;
+				}
+			}
+		}
 		const now = new Date();
-		// Appliquer le décalage en secondes
 		const offsetDate = new Date(now.getTime() + this.settings.timeOffsetSeconds * 1000);
 		const placeholder = this.buildPlaceholder(offsetDate);
 		const fallback = this.buildPlaceholderLabel(offsetDate);
@@ -362,10 +697,15 @@ export default class RecordingIndicatorPlugin extends Plugin {
 
 	async linkRecordingToActiveNote(file: TFile, startTime: Date) {
 		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-		if (!view) {
+		if (!view || !view.file) {
 			new Notice('Ouvrez une note Markdown pour associer un enregistrement.');
 			return;
 		}
+
+		await this.app.fileManager.processFrontMatter(view.file, (frontmatter) => {
+			frontmatter['audio_file'] = this.app.metadataCache.fileToLinktext(file, view.file!.path);
+			frontmatter['audio_start_time'] = this.formatStartTimeForInput(startTime);
+		});
 
 		const editor = view.editor;
 		const content = editor.getValue();
@@ -482,9 +822,14 @@ export default class RecordingIndicatorPlugin extends Plugin {
 		return `%%REC${payload}%%`;
 	}
 
-	private buildPlaceholderLabel(date: Date): string {
+	buildPlaceholderLabel(date: Date): string {
 		const formatted = this.formatAbsoluteTime(date);
 		return this.settings.timecodeFormat.replace('{time}', formatted);
+	}
+
+	getCompactTimeLabel(date: Date): string {
+		const label = this.buildPlaceholderLabel(date);
+		return label.replace(/^[\[(]|[)\]]$/g, '');
 	}
 
 	private formatAbsoluteTime(date: Date): string {
@@ -1109,6 +1454,178 @@ export default class RecordingIndicatorPlugin extends Plugin {
 			return adapter.getResourcePath(file.path);
 		} catch {
 			return null;
+		}
+	}
+
+	private getLinkedAudioFile(note: TFile): TFile | null {
+		const metadata = this.app.metadataCache.getFileCache(note);
+		
+		if (metadata?.frontmatter?.audio_file) {
+			const audioLink = metadata.frontmatter.audio_file;
+			const resolved = this.resolveFileFromLink(audioLink, note);
+			if (resolved && this.isAudioFile(resolved)) {
+				return resolved;
+			}
+		}
+
+		if (metadata?.links) {
+			for (const link of metadata.links) {
+				const resolved = this.resolveFileFromLink(link.link, note);
+				if (resolved && this.isAudioFile(resolved)) {
+					return resolved;
+				}
+			}
+		}
+
+		if (metadata?.embeds) {
+			for (const embed of metadata.embeds) {
+				const resolved = this.resolveFileFromLink(embed.link, note);
+				if (resolved && this.isAudioFile(resolved)) {
+					return resolved;
+				}
+			}
+		}
+
+		return null;
+	}
+
+	private findPlayerForFile(file: TFile): HTMLMediaElement | null {
+		const resourcePath = this.getAdapterResourcePath(file);
+		if (!resourcePath) {
+			return null;
+		}
+
+		const baseResourcePath = resourcePath.split('?')[0];
+
+		const allMediaElements: HTMLMediaElement[] = [];
+		
+		const collectMedia = (root: Document | ShadowRoot) => {
+			root.querySelectorAll<HTMLMediaElement>('audio, video').forEach(el => allMediaElements.push(el));
+			
+			root.querySelectorAll('*').forEach(el => {
+				if (el.shadowRoot) {
+					collectMedia(el.shadowRoot);
+				}
+			});
+		};
+		
+		collectMedia(document);
+		
+		for (const media of allMediaElements) {
+			const candidates = new Set<string>();
+			
+			if (media.currentSrc) {
+				candidates.add(media.currentSrc);
+			}
+			if (media.src) {
+				candidates.add(media.src);
+			}
+			
+			media.querySelectorAll('source').forEach((source) => {
+				if (source instanceof HTMLSourceElement && source.src) {
+					candidates.add(source.src);
+				}
+			});
+
+			for (const candidate of candidates) {
+				const baseCandidate = candidate.split('?')[0];
+				if (candidate === resourcePath || baseCandidate === baseResourcePath) {
+					return media;
+				}
+			}
+		}
+		
+		const fileName = file.basename;
+		for (const media of allMediaElements) {
+			const src = media.currentSrc || media.src;
+			if (src && src.includes(encodeURIComponent(fileName))) {
+				return media;
+			}
+		}
+
+		return null;
+	}
+
+	private getStartTimeForFile(file: TFile): Date | null {
+		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+		if (!view?.file) {
+			return null;
+		}
+
+		const metadata = this.app.metadataCache.getFileCache(view.file);
+		
+		if (metadata?.frontmatter?.audio_start_time) {
+			const parsed = this.parseStartTimeInput(metadata.frontmatter.audio_start_time);
+			if (parsed) {
+				return parsed;
+			}
+		}
+
+		const parsedFromFilename = this.parseDateFromFileName(file.basename);
+		if (parsedFromFilename) {
+			return parsedFromFilename;
+		}
+
+		return null;
+	}
+
+	private processTimecodeWidgets(element: HTMLElement, context: MarkdownPostProcessorContext) {
+		const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT, null);
+		const nodesToProcess: { node: Text; matches: RegExpMatchArray[] }[] = [];
+
+		let node: Node | null;
+		while ((node = walker.nextNode())) {
+			if (node.nodeType === Node.TEXT_NODE && node.textContent) {
+				const text = node.textContent;
+				const regex = /%%REC\{"time":"([^"]+)"\}%%(\[[^\]]+\]|\([^)]+\)|[^\s]+)/g;
+				const matches = Array.from(text.matchAll(regex));
+				if (matches.length > 0) {
+					nodesToProcess.push({ node: node as Text, matches });
+				}
+			}
+		}
+
+		for (const { node, matches } of nodesToProcess) {
+			const text = node.textContent!;
+			const fragments: (string | HTMLElement)[] = [];
+			let lastIndex = 0;
+
+			for (const match of matches) {
+				const matchStart = match.index!;
+				const matchEnd = matchStart + match[0].length;
+
+				if (matchStart > lastIndex) {
+					fragments.push(text.substring(lastIndex, matchStart));
+				}
+
+				const widgetContainer = document.createElement('span');
+				const widget = new TimecodeWidget(
+					widgetContainer,
+					this,
+					match[1],
+					context.sourcePath
+				);
+				context.addChild(widget);
+				fragments.push(widgetContainer);
+
+				lastIndex = matchEnd;
+			}
+
+			if (lastIndex < text.length) {
+				fragments.push(text.substring(lastIndex));
+			}
+
+			const parent = node.parentNode;
+			if (parent) {
+				for (const fragment of fragments) {
+					if (typeof fragment === 'string') {
+						parent.insertBefore(document.createTextNode(fragment), node);
+					} else {
+						parent.insertBefore(fragment, node);
+					}
+				}
+				parent.removeChild(node);
+			}
 		}
 	}
 }

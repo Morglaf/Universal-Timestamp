@@ -1,6 +1,8 @@
 import esbuild from "esbuild";
 import process from "process";
 import builtins from "builtin-modules";
+import fs from "fs";
+import path from "path";
 
 const banner =
 `/*
@@ -10,6 +12,35 @@ if you want to view the source, please visit the github repository of this plugi
 `;
 
 const prod = (process.argv[2] === 'production');
+
+// Plugin pour copier les fichiers vers le dossier Obsidian
+const copyPlugin = {
+	name: 'copy-to-obsidian',
+	setup(build) {
+		build.onEnd(async () => {
+			const destDir = "D:\\Notes\\.obsidian\\plugins\\Universal Timestamp";
+
+			try {
+				if (!fs.existsSync(destDir)) {
+					fs.mkdirSync(destDir, { recursive: true });
+				}
+
+				const filesToCopy = ['main.js', 'styles.css', 'manifest.json'];
+
+				for (const file of filesToCopy) {
+					const sourcePath = path.join(process.cwd(), file);
+					if (fs.existsSync(sourcePath)) {
+						const destPath = path.join(destDir, file);
+						fs.copyFileSync(sourcePath, destPath);
+						console.log(`Copied ${file} to ${destDir}`);
+					}
+				}
+			} catch (err) {
+				console.error('Error copying files:', err);
+			}
+		});
+	},
+};
 
 const context = await esbuild.context({
 	banner: {
@@ -38,6 +69,7 @@ const context = await esbuild.context({
 	sourcemap: prod ? false : 'inline',
 	treeShaking: true,
 	outfile: 'main.js',
+	plugins: [copyPlugin],
 });
 
 if (prod) {

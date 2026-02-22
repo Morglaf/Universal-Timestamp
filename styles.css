@@ -85,3 +85,48 @@
     width: 16px;
     height: 16px;
 }
+
+/* Widget de timecode interactif (compact) */
+.ut-timecode-widget {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    padding: 1px 3px;
+    background: var(--background-secondary);
+    border-radius: 3px;
+    vertical-align: middle;
+}
+
+.ut-timecode-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    border-radius: 3px;
+    border: 1px solid var(--background-modifier-border);
+    background: var(--interactive-normal);
+    cursor: pointer;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-normal);
+    transition: background-color 0.15s ease, transform 0.1s ease;
+    padding: 0;
+}
+
+.ut-timecode-btn:hover {
+    background: var(--interactive-hover);
+    transform: scale(1.05);
+}
+
+.ut-timecode-btn:active {
+    transform: scale(0.95);
+}
+
+.ut-timecode-display {
+    font-family: var(--font-monospace);
+    padding: 0 4px;
+    font-size: 0.9em;
+    color: var(--text-normal);
+    user-select: none;
+}

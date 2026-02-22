@@ -62,6 +62,22 @@ export class RecordingIndicatorSettingTab extends PluginSettingTab {
 					})
 			);
 
+		new Setting(containerEl)
+			.setName('Intervalle d\'ajustement')
+			.setDesc('Nombre de secondes à ajouter/retirer avec les boutons +/- du widget de timecode.')
+			.addText((text) =>
+				text
+					.setPlaceholder('10')
+					.setValue(this.plugin.settings.timecodeAdjustmentSeconds.toString())
+					.onChange(async (value) => {
+						const numValue = Number.parseInt(value, 10);
+						if (!Number.isNaN(numValue) && numValue > 0) {
+							this.plugin.settings.timecodeAdjustmentSeconds = numValue;
+							await this.plugin.saveSettings();
+						}
+					})
+			);
+
 		containerEl.createEl('h3', { text: 'Notifications' });
 
 		new Setting(containerEl)
